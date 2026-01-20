@@ -109,17 +109,28 @@ Compustat Annual Fundamentals: comp.funda
 - sich: SIC code (for filtering out financials 6000-6999 and pharma 2834)
 - curcd: currency (filter for USD)
 - fic: country of incorporation (filter for USA)
-- exchg: stock exchange code (filter for 11-19)
+- exchg: stock exchange code (filter for 11, 14 = NYSE and NASDAQ only)
 
-CRSP Monthly Stock File: crsp.msf
+CRSP Daily Stock File: crsp.dsf
 
 - permno: security identifier
-- date: month end date
-- ret: holding period return
-- dlret: delisting return
+- date: trading date
+- ret: daily holding period return
 - prc: price (need absolute value, sometimes negative to indicate bid/ask avg)
 - shrout: shares outstanding
-- siccd: SIC code (also filter here for financials and pharma)
+- hsiccd: historical SIC code (filter for financials and pharma)
+
+Delisting Returns: crsp.dsedelist
+
+- permno: security identifier
+- dlstdt: delisting date
+- dlret: delisting return
+
+Daily to Monthly Compounding:
+
+- Pull daily returns from crsp.dsf
+- Compound within each month: Monthly_Ret = ∏(1 + daily_ret) - 1
+- Use end-of-month price/shares for market cap
 
 CCM Link Table: crsp.ccmxpf_lnkhist
 
@@ -134,27 +145,29 @@ Note: verify exact table names against WRDS documentation, sometimes they change
 
 Results
 
-Raw Returns (Annualized):
+*Note: Results below are from the previous run with monthly returns. Re-run the scripts with the updated daily returns methodology to get new results.*
 
-- EW_NoRD: 11.50%
-- EW_RD: 15.25%
-- VW_NoRD: 9.69%
-- VW_RD: 12.31%
-- R&D firms outperform in raw returns
+**Raw Returns (Annualized):**
 
-CAPM Alpha Results:
+| Portfolio | Annualized Return |
+|-----------|-------------------|
+| EW_NoRD   | 11.50%            |
+| EW_RD     | 15.25%            |
+| VW_NoRD   | 9.69%             |
+| VW_RD     | 12.31%            |
 
-- EW_NoRD: 0.16% annual alpha, t-stat 0.08 (not significant)
-- EW_RD: 1.19% annual alpha, t-stat 0.48 (not significant)
-- VW_NoRD: -0.62% annual alpha, t-stat -0.68 (not significant)
-- VW_RD: -0.50% annual alpha, t-stat -0.52 (not significant)
+*R&D firms outperform in raw returns*
 
-Fama-French 3-Factor Alpha Results:
+**Alpha Results Summary:**
 
-- EW_NoRD: -0.83% annual alpha, t-stat -0.63 (not significant)
-- EW_RD: 2.12% annual alpha, t-stat 1.37 (not significant)
-- VW_NoRD: -1.17% annual alpha, t-stat -1.36 (not significant)
-- VW_RD: 0.25% annual alpha, t-stat 0.29 (not significant)
+| Portfolio | CAPM Alpha (Ann.) | CAPM t-stat | FF3 Alpha (Ann.) | FF3 t-stat | Significant? |
+|-----------|-------------------|-------------|------------------|------------|--------------|
+| EW_NoRD   | 0.16%             | 0.08        | -0.83%           | -0.63      | No           |
+| EW_RD     | 1.19%             | 0.48        | 2.12%            | 1.37       | No           |
+| VW_NoRD   | -0.62%            | -0.68       | -1.17%           | -1.36      | No           |
+| VW_RD     | -0.50%            | -0.52       | 0.25%            | 0.29       | No           |
+
+*Note: Significance requires |t-stat| > 1.96 (5% level) or |t-stat| > 2.58 (1% level)*
 
 Key Finding: No Significant Alpha
 
@@ -178,7 +191,11 @@ Conclusion:
 Assignment Checklist
 
 - Pull from Compustat and CRSP → done
-- Apply filters (exchanges, exclude financials/pharma, US only) → done
+- Apply filters (NYSE + NASDAQ only via exchg 11,14) → done
+- Exclude financials (SIC 6000-6999) and pharma (SIC 2834) → done
+- US only companies (fic='USA', curcd='USD') → done
+- Pull daily returns from CRSP (crsp.dsf) → done
+- Compound daily returns to monthly → done
 - Remove unusual returns (ret < -100%) → done
 - Create 4 portfolios (2 EW, 2 VW with and without R&D) → done
 - t-1 R&D with look-ahead bias handling (+6 month lag) → done
