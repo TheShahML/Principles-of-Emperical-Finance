@@ -29,9 +29,22 @@ print("\nCreating portfolio formation dates...")
 compustat['datadate'] = pd.to_datetime(compustat['datadate'])
 compustat['portfolio_start'] = compustat['datadate'] + pd.DateOffset(months=6)
 
-# Portfolio year = the year in which we form the portfolio
-# e.g., Dec 2000 fiscal year -> portfolio starts July 2001 -> portfolio_year = 2001
-compustat['portfolio_year'] = compustat['portfolio_start'].dt.year
+# Portfolio year = the July-June period this R&D data will be used in
+# e.g., Dec 1999 fiscal year -> filed by June 2000 -> used in July 2000-June 2001 period
+# Since the July-June period is identified by the year of July, we need:
+# - If portfolio_start is Jan-June: portfolio_year = year of portfolio_start
+# - If portfolio_start is July-Dec: portfolio_year = year of portfolio_start
+# Actually simpler: Just use the year when July starts for this data
+# Dec 1999 FYE -> +6mo = June 2000 -> July 2000 is the start -> portfolio_year = 2000
+
+# For Fama-French alignment: the portfolio_year is when July falls
+# If datadate + 6 months lands in Jan-June of year Y, July is in year Y
+# If datadate + 6 months lands in July-Dec of year Y, July is in year Y+1
+compustat['portfolio_year'] = np.where(
+    compustat['portfolio_start'].dt.month >= 7,
+    compustat['portfolio_start'].dt.year + 1,  # July-Dec → next July
+    compustat['portfolio_start'].dt.year        # Jan-June → this July
+)
 
 print(f"Portfolio years range: {compustat['portfolio_year'].min()} to {compustat['portfolio_year'].max()}")
 
@@ -51,8 +64,14 @@ rd_counts = compustat.groupby('portfolio_year')['has_rd'].agg(['sum', 'count'])
 rd_counts['pct_rd'] = 100 * rd_counts['sum'] / rd_counts['count']
 print(f"Average % of firms with R&D across years: {rd_counts['pct_rd'].mean():.1f}%")
 
-# Keep only the columns we need for merging
-compustat_slim = compustat[['lpermno', 'portfolio_year', 'has_rd', 'datadate']].copy()
+# Debug: Check portfolio year range in Compustat
+print(f"\nCompustat portfolio years available:")
+print(f"  Min portfolio_year: {compustat['portfolio_year'].min()}")
+print(f"  Max portfolio_year: {compustat['portfolio_year'].max()}")
+print(f"  Years with data: {sorted(compustat['portfolio_year'].unique())[:10]}")  # Show first 10 years
+
+# Keep only the columns we need for merging (include link dates for filtering)
+compustat_slim = compustat[['lpermno', 'portfolio_year', 'has_rd', 'datadate', 'linkdt', 'linkenddt']].copy()
 compustat_slim = compustat_slim.rename(columns={'lpermno': 'permno'})
 
 # =============================================================================
@@ -80,6 +99,14 @@ crsp['portfolio_year'] = np.where(
 
 print(f"CRSP portfolio years range: {crsp['portfolio_year'].min()} to {crsp['portfolio_year'].max()}")
 
+# Debug: Show overlap
+print(f"\nChecking Compustat-CRSP portfolio year overlap:")
+compustat_years = set(compustat_slim['portfolio_year'].unique())
+crsp_years = set(crsp['portfolio_year'].unique())
+overlap_years = sorted(compustat_years & crsp_years)
+print(f"  Overlapping years: {overlap_years[:5]} ... {overlap_years[-5:]}")
+print(f"  Total overlapping years: {len(overlap_years)}")
+
 # =============================================================================
 # Step 5: Merge CRSP returns with R&D classification
 # =============================================================================
@@ -89,13 +116,32 @@ print("\nMerging CRSP with R&D classification...")
 # Merge on permno and portfolio_year
 # This assigns each firm-month to R&D or No-R&D based on prior year's R&D
 merged = crsp.merge(
-    compustat_slim[['permno', 'portfolio_year', 'has_rd']],
+    compustat_slim[['permno', 'portfolio_year', 'has_rd', 'linkdt', 'linkenddt']],
     on=['permno', 'portfolio_year'],
     how='inner'
 )
 
-print(f"Merged rows: {len(merged)}")
+print(f"Initial merge rows: {len(merged)}")
+
+# =============================================================================
+# Step 5b: Apply CCM Link Date Filtering
+# =============================================================================
+
+print("\nApplying CCM link date filtering...")
+
+# Filter: CRSP date must be within link validity period
+# This ensures we only use valid GVKEY-PERMNO links
+initial_count = len(merged)
+merged = merged[
+    (merged['date'] >= merged['linkdt']) &
+    (merged['date'] <= merged['linkenddt'])
+]
+
+print(f"After CCM link date filtering: {len(merged)} rows ({initial_count - len(merged)} removed)")
 print(f"Unique firms in merged data: {merged['permno'].nunique()}")
+
+# Drop link date columns - no longer needed
+merged = merged.drop(['linkdt', 'linkenddt'], axis=1)
 
 # Check the split
 rd_obs = merged['has_rd'].sum()
@@ -191,219 +237,169 @@ merged.to_parquet('firm_monthly_returns.parquet', index=False)
 print("Firm-level monthly returns saved to firm_monthly_returns.parquet")
 
 # =============================================================================
-# Step 10: Pull Fama-French Factors and Risk-Free Rate
+# Step 10: Load CRSP Value-Weighted Market Index and Risk-Free Rate
 # =============================================================================
 
 print("\n" + "="*60)
-print("PULLING FAMA-FRENCH FACTORS")
+print("LOADING CRSP VALUE-WEIGHTED MARKET INDEX & RISK-FREE RATE")
 print("="*60)
 
-import wrds
-conn = wrds.Connection()
+# Load market index and risk-free rate from saved data
+market_data = pd.read_parquet('market_index.parquet')
+market_data['date'] = pd.to_datetime(market_data['date'])
 
-# Pull Fama-French 3 factors (includes market excess return and risk-free rate)
-ff_query = """
-    SELECT date, mktrf, smb, hml, rf
-    FROM ff.factors_monthly
-    WHERE date BETWEEN '1980-01-01' AND '2022-12-31'
-"""
+print(f"Market data rows: {len(market_data)}")
+print(f"Date range: {market_data['date'].min()} to {market_data['date'].max()}")
+print(f"Average monthly market return: {market_data['vwretd'].mean()*100:.3f}%")
+print(f"Average monthly RF rate: {market_data['rf'].mean()*100:.3f}%")
 
-print("Pulling Fama-French factors...")
-ff_factors = conn.raw_sql(ff_query)
-ff_factors['date'] = pd.to_datetime(ff_factors['date'])
-
-# Check FF factors scale - print sample values
-print(f"DEBUG - FF factor sample values BEFORE scaling:")
-print(ff_factors[['mktrf', 'smb', 'hml', 'rf']].head())
-print(f"DEBUG - mktrf mean: {ff_factors['mktrf'].mean()}")
-
-# If mktrf mean is > 0.5, factors are in percentage terms (e.g., 1.5 = 1.5%)
-# If mktrf mean is < 0.05, factors are already in decimal form (e.g., 0.015 = 1.5%)
-if ff_factors['mktrf'].mean() > 0.5:
-    print("Factors appear to be in percentage terms, converting to decimal...")
-    for col in ['mktrf', 'smb', 'hml', 'rf']:
-        ff_factors[col] = ff_factors[col] / 100
-else:
-    print("Factors appear to already be in decimal form, no conversion needed.")
-
-conn.close()
-print(f"Fama-French factors: {len(ff_factors)} months")
-
-# Merge factors with portfolio returns
+# Normalize dates to end of month for proper matching
 portfolio_returns['date'] = pd.to_datetime(portfolio_returns['date'])
-
-# Debug: check date formats
-print(f"\nDEBUG - Portfolio returns date sample: {portfolio_returns['date'].head()}")
-print(f"DEBUG - FF factors date sample: {ff_factors['date'].head()}")
-
-# Normalize both to end of month for proper matching
 portfolio_returns['date'] = portfolio_returns['date'] + pd.offsets.MonthEnd(0)
-ff_factors['date'] = ff_factors['date'] + pd.offsets.MonthEnd(0)
+market_data['date'] = market_data['date'] + pd.offsets.MonthEnd(0)
 
-print(f"DEBUG - After normalization:")
-print(f"DEBUG - Portfolio returns date sample: {portfolio_returns['date'].head()}")
-print(f"DEBUG - FF factors date sample: {ff_factors['date'].head()}")
-
-portfolio_with_factors = portfolio_returns.merge(ff_factors, on='date', how='inner')
-print(f"Portfolio returns with factors: {len(portfolio_with_factors)} months")
+# Merge portfolio returns with market data
+portfolio_with_market = portfolio_returns.merge(market_data, on='date', how='inner')
+print(f"Portfolio returns with market data: {len(portfolio_with_market)} months")
 
 # =============================================================================
-# Step 11: Calculate Excess Returns
+# Step 11: Calculate Excess Returns (Portfolio - RF and Market - RF)
 # =============================================================================
 
-print("\nCalculating excess returns...")
+print("\nCalculating excess returns for CAPM regression...")
 
 # Ensure numeric types
-for col in ['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD', 'mktrf', 'smb', 'hml', 'rf']:
-    portfolio_with_factors[col] = pd.to_numeric(portfolio_with_factors[col], errors='coerce')
+for col in ['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD', 'vwretd', 'rf']:
+    portfolio_with_market[col] = pd.to_numeric(portfolio_with_market[col], errors='coerce')
 
 # Drop rows with any NaN values in key columns
-portfolio_with_factors = portfolio_with_factors.dropna(subset=['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD', 'mktrf', 'smb', 'hml', 'rf'])
-print(f"Rows after dropping NaN: {len(portfolio_with_factors)}")
+portfolio_with_market = portfolio_with_market.dropna(subset=['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD', 'vwretd', 'rf'])
+print(f"Rows after dropping NaN: {len(portfolio_with_market)}")
 
-# Excess return = portfolio return - risk-free rate
+# Calculate excess returns: Return - Risk-free rate
+# This is the theoretically correct approach for CAPM
 for col in ['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD']:
-    portfolio_with_factors[f'{col}_excess'] = portfolio_with_factors[col] - portfolio_with_factors['rf']
+    portfolio_with_market[f'{col}_excess'] = portfolio_with_market[col] - portfolio_with_market['rf']
+
+# Market excess return (market risk premium)
+portfolio_with_market['market_excess'] = portfolio_with_market['vwretd'] - portfolio_with_market['rf']
+
+# Display sample
+print("\nSample of excess returns (first 5 months):")
+print(portfolio_with_market[['date', 'EW_NoRD_excess', 'EW_RD_excess', 'VW_NoRD_excess', 'VW_RD_excess', 'market_excess']].head())
+print(f"\nAverage monthly market premium: {portfolio_with_market['market_excess'].mean()*100:.3f}%")
 
 # =============================================================================
-# Step 12: Run Alpha Regressions (CAPM)
+# Step 12: Run CAPM Regressions (Jensen's Alpha)
 # =============================================================================
 
 print("\n" + "="*60)
-print("CAPM ALPHA REGRESSIONS")
+print("CAPM ALPHA REGRESSIONS (JENSEN'S ALPHA)")
 print("="*60)
-print("Model: R_portfolio - Rf = alpha + beta * (R_market - Rf) + epsilon")
+print("Model: (R_p - R_f) = alpha + beta * (R_m - R_f) + epsilon")
 print("="*60)
 
 import statsmodels.api as sm
 
-def run_capm_regression(excess_returns, mktrf):
-    """Run CAPM regression and return results"""
-    # Convert to numpy arrays to avoid dtype issues
-    y = np.asarray(excess_returns, dtype=float)
-    x = np.asarray(mktrf, dtype=float)
-    X = sm.add_constant(x)
-    model = sm.OLS(y, X).fit()
-    return model
-
-capm_results = {}
-for portfolio in ['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD']:
-    excess_col = f'{portfolio}_excess'
-    model = run_capm_regression(
-        portfolio_with_factors[excess_col],
-        portfolio_with_factors['mktrf']
-    )
-    capm_results[portfolio] = model
-
-    # params[0] is const/alpha, params[1] is beta
-    alpha = model.params[0]
-    alpha_tstat = model.tvalues[0]
-    alpha_pval = model.pvalues[0]
-    beta = model.params[1]
-    r_squared = model.rsquared
-
-    print(f"\n{portfolio}:")
-    print(f"  Alpha (monthly): {alpha:.4f} ({alpha*12:.4f} annualized)")
-    print(f"  Alpha t-stat:    {alpha_tstat:.2f}")
-    print(f"  Alpha p-value:   {alpha_pval:.4f}")
-    print(f"  Beta:            {beta:.3f}")
-    print(f"  R-squared:       {r_squared:.3f}")
-
-    # Significance indicator
-    if alpha_pval < 0.01:
-        sig = "***"
-    elif alpha_pval < 0.05:
-        sig = "**"
-    elif alpha_pval < 0.10:
-        sig = "*"
-    else:
-        sig = ""
-    print(f"  Significance:    {sig} (*** p<0.01, ** p<0.05, * p<0.10)")
-
-# =============================================================================
-# Step 13: Run Alpha Regressions (Fama-French 3-Factor)
-# =============================================================================
-
-print("\n" + "="*60)
-print("FAMA-FRENCH 3-FACTOR ALPHA REGRESSIONS")
-print("="*60)
-print("Model: R_p - Rf = alpha + b1*MktRf + b2*SMB + b3*HML + epsilon")
-print("="*60)
-
-def run_ff3_regression(excess_returns, mktrf, smb, hml):
-    """Run Fama-French 3-factor regression and return results"""
-    # Convert to numpy arrays to avoid dtype issues
-    y = np.asarray(excess_returns, dtype=float)
-    X = np.column_stack([
-        np.asarray(mktrf, dtype=float),
-        np.asarray(smb, dtype=float),
-        np.asarray(hml, dtype=float)
-    ])
-    X = sm.add_constant(X)
-    model = sm.OLS(y, X).fit()
-    return model
-
-ff3_results = {}
-for portfolio in ['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD']:
-    excess_col = f'{portfolio}_excess'
-    model = run_ff3_regression(
-        portfolio_with_factors[excess_col],
-        portfolio_with_factors['mktrf'],
-        portfolio_with_factors['smb'],
-        portfolio_with_factors['hml']
-    )
-    ff3_results[portfolio] = model
-
-    # params[0] is const/alpha, params[1-3] are factor betas
-    alpha = model.params[0]
-    alpha_tstat = model.tvalues[0]
-    alpha_pval = model.pvalues[0]
-
-    print(f"\n{portfolio}:")
-    print(f"  Alpha (monthly): {alpha:.4f} ({alpha*12:.4f} annualized)")
-    print(f"  Alpha t-stat:    {alpha_tstat:.2f}")
-    print(f"  Alpha p-value:   {alpha_pval:.4f}")
-    print(f"  MktRf beta:      {model.params[1]:.3f}")
-    print(f"  SMB beta:        {model.params[2]:.3f}")
-    print(f"  HML beta:        {model.params[3]:.3f}")
-    print(f"  R-squared:       {model.rsquared:.3f}")
-
-    # Significance indicator
-    if alpha_pval < 0.01:
-        sig = "***"
-    elif alpha_pval < 0.05:
-        sig = "**"
-    elif alpha_pval < 0.10:
-        sig = "*"
-    else:
-        sig = ""
-    print(f"  Significance:    {sig}")
-
-# =============================================================================
-# Step 14: Summary Table
-# =============================================================================
-
-print("\n" + "="*60)
-print("SUMMARY TABLE")
-print("="*60)
-
+alpha_results = {}
 summary_data = []
-for portfolio in ['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD']:
-    capm = capm_results[portfolio]
-    ff3 = ff3_results[portfolio]
 
-    # Use index 0 for const/alpha (numpy array indexing)
+for portfolio in ['EW_NoRD', 'EW_RD', 'VW_NoRD', 'VW_RD']:
+    print(f"\n{'-'*60}")
+    print(f"Portfolio: {portfolio}")
+    print(f"{'-'*60}")
+
+    excess_col = f'{portfolio}_excess'
+
+    # Prepare data for CAPM regression
+    # y = portfolio excess return (R_p - R_f)
+    # X = market excess return (R_m - R_f)
+    y = np.array(portfolio_with_market[excess_col].values, dtype=float)
+    X = np.array(portfolio_with_market['market_excess'].values, dtype=float)
+    X = sm.add_constant(X)  # Add intercept
+
+    # Run OLS regression
+    model = sm.OLS(y, X)
+    results = model.fit()
+
+    # Extract results
+    alpha_monthly = results.params[0]  # Intercept = Jensen's alpha
+    beta = results.params[1]           # Slope = market beta
+    alpha_se = results.bse[0]          # Standard error of alpha
+    alpha_tstat = results.tvalues[0]   # t-statistic for alpha
+    alpha_pval = results.pvalues[0]    # p-value for alpha
+    r_squared = results.rsquared       # R-squared
+    n_obs = results.nobs               # Number of observations
+
+    # Annualize alpha
+    alpha_annual = alpha_monthly * 12
+
+    # Significance indicator
+    if alpha_pval < 0.01:
+        sig = "***"
+    elif alpha_pval < 0.05:
+        sig = "**"
+    elif alpha_pval < 0.10:
+        sig = "*"
+    else:
+        sig = ""
+
+    # Store results
+    alpha_results[portfolio] = {
+        'alpha_monthly': alpha_monthly,
+        'alpha_annual': alpha_annual,
+        'beta': beta,
+        'alpha_se': alpha_se,
+        't_stat': alpha_tstat,
+        'p_value': alpha_pval,
+        'r_squared': r_squared,
+        'n_obs': n_obs,
+        'significance': sig
+    }
+
+    # Print results
+    print(f"\nRegression Results:")
+    print(f"  Alpha (monthly):     {alpha_monthly*100:>8.3f}%")
+    print(f"  Alpha (annual):      {alpha_annual*100:>8.3f}%")
+    print(f"  Beta:                {beta:>8.3f}")
+    print(f"  Alpha t-stat:        {alpha_tstat:>8.3f} {sig}")
+    print(f"  Alpha p-value:       {alpha_pval:>8.4f}")
+    print(f"  R-squared:           {r_squared:>8.3f}")
+    print(f"  Observations:        {n_obs:>8.0f}")
+
     summary_data.append({
         'Portfolio': portfolio,
-        'CAPM Alpha (ann.)': f"{capm.params[0]*12:.4f}",
-        'CAPM t-stat': f"{capm.tvalues[0]:.2f}",
-        'FF3 Alpha (ann.)': f"{ff3.params[0]*12:.4f}",
-        'FF3 t-stat': f"{ff3.tvalues[0]:.2f}"
+        'Alpha (Monthly)': f"{alpha_monthly:.4f}",
+        'Alpha (Annual)': f"{alpha_annual:.4f}",
+        'Alpha (Annual %)': f"{alpha_annual*100:.2f}%",
+        'Beta': f"{beta:.3f}",
+        't-stat': f"{alpha_tstat:.2f}",
+        'p-value': f"{alpha_pval:.4f}",
+        'R²': f"{r_squared:.3f}",
+        'Significance': sig
     })
+
+print("\n" + "="*60)
+print("Significance levels: *** p<0.01, ** p<0.05, * p<0.10")
+print("="*60)
+
+# =============================================================================
+# Step 13: Summary Table
+# =============================================================================
+
+print("\n" + "="*60)
+print("CAPM ALPHA SUMMARY TABLE")
+print("="*60)
 
 summary_df = pd.DataFrame(summary_data)
 print(summary_df.to_string(index=False))
 
 # Save summary
 summary_df.to_csv('alpha_summary.csv', index=False)
-print("\nSummary saved to alpha_summary.csv")
+print("\n" + "="*60)
+print("Summary saved to alpha_summary.csv")
+print("="*60)
+
+print("\n" + "="*80)
+print("ANALYSIS COMPLETE!")
+print("="*80)

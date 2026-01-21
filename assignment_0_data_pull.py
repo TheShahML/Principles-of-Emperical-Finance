@@ -35,7 +35,7 @@ compustat_query = """
     WHERE fyear BETWEEN 1979 AND 2021
         AND curcd = 'USD'
         AND fic = 'USA'
-        AND exchg IN (11, 14)             -- NYSE (11) and NASDAQ (14) only
+        AND exchg BETWEEN 11 AND 19       -- Major US exchanges (NYSE, AMEX, NASDAQ)
         AND sich IS NOT NULL
         AND (sich < 6000 OR sich > 6999)  -- exclude financials
         AND sich != 2834                   -- exclude pharmaceuticals
@@ -97,32 +97,34 @@ print(f"After date filtering: {len(compustat_linked)} rows")
 print(f"Unique firms (lpermno): {compustat_linked['lpermno'].nunique()}")
 
 # =============================================================================
-# Step 5: Pull CRSP Daily Stock File
+# Step 5: Pull CRSP Monthly Stock File
 # =============================================================================
 
-# Pull daily returns (as required by assignment) - we'll compound to monthly later
-crsp_daily_query = """
+# Pull monthly returns directly from CRSP Monthly Stock File (msf)
+# This is much faster than pulling daily and compounding
+crsp_monthly_query = """
     SELECT permno, date, ret, prc, shrout, hsiccd
-    FROM crsp.dsf
+    FROM crsp.msf
     WHERE date BETWEEN '1980-01-01' AND '2022-12-31'
         AND hsiccd IS NOT NULL
         AND (hsiccd < 6000 OR hsiccd > 6999)
         AND hsiccd != 2834
 """
 
-print("\nPulling CRSP daily data...")
-crsp_daily = conn.raw_sql(crsp_daily_query)
-crsp_daily['date'] = pd.to_datetime(crsp_daily['date'])
-print(f"CRSP daily rows: {len(crsp_daily)}")
-print(f"Unique securities (permno): {crsp_daily['permno'].nunique()}")
+print("\nPulling CRSP monthly data...")
+crsp = conn.raw_sql(crsp_monthly_query)
+crsp['date'] = pd.to_datetime(crsp['date'])
+print(f"CRSP monthly rows: {len(crsp)}")
+print(f"Unique securities (permno): {crsp['permno'].nunique()}")
 
 # =============================================================================
-# Step 5b: Pull Delisting Returns (daily delisting table)
+# Step 5b: Pull Delisting Returns
 # =============================================================================
 
+# Delisting returns are in a separate table - merge them in
 delist_query = """
     SELECT permno, dlstdt, dlret
-    FROM crsp.dsedelist
+    FROM crsp.msedelist
     WHERE dlstdt BETWEEN '1980-01-01' AND '2022-12-31'
 """
 
@@ -131,79 +133,109 @@ delist = conn.raw_sql(delist_query)
 delist['dlstdt'] = pd.to_datetime(delist['dlstdt'])
 print(f"Delisting events: {len(delist)}")
 
-# Merge delisting returns with daily file on exact date
-crsp_daily = crsp_daily.merge(
+# Merge delisting returns with monthly file
+# Match on permno and date (dlstdt = date of delisting)
+crsp = crsp.merge(
     delist[['permno', 'dlstdt', 'dlret']].rename(columns={'dlstdt': 'date'}),
     on=['permno', 'date'],
     how='left'
 )
-print(f"CRSP daily rows after delist merge: {len(crsp_daily)}")
+print(f"CRSP monthly rows after delist merge: {len(crsp)}")
 
 # =============================================================================
-# Step 6: Clean Daily Returns and Compound to Monthly
+# Step 6: Clean Monthly Returns
 # =============================================================================
 
-print("\nCleaning CRSP daily returns...")
+print("\nCleaning CRSP monthly returns...")
 
-# Convert ret to numeric (handles any letter codes)
-crsp_daily['ret'] = pd.to_numeric(crsp_daily['ret'], errors='coerce')
+# Convert ret and dlret to numeric (handles any letter codes)
+crsp['ret'] = pd.to_numeric(crsp['ret'], errors='coerce')
+crsp['dlret'] = pd.to_numeric(crsp['dlret'], errors='coerce')
 
 # Remove if return is NA or less than -100% (as per assignment)
-crsp_daily = crsp_daily[crsp_daily['ret'].notna()]
-crsp_daily = crsp_daily[crsp_daily['ret'] >= -1.0]  # -100% = -1.0 in decimal
+crsp = crsp[crsp['ret'].notna()]
+crsp = crsp[crsp['ret'] >= -1.0]  # -100% = -1.0 in decimal
 
-# Handle delisting returns at daily level
-crsp_daily['dlret'] = pd.to_numeric(crsp_daily['dlret'], errors='coerce')
-
-# Compound ret and dlret where both exist, otherwise use available one
-crsp_daily['ret_adj'] = crsp_daily.apply(
+# Handle delisting returns: compound with regular returns if both exist
+crsp['ret_adj'] = crsp.apply(
     lambda row: (1 + row['ret']) * (1 + row['dlret']) - 1
                 if pd.notna(row['dlret'])
                 else row['ret'],
     axis=1
 )
 
-print(f"After cleaning: {len(crsp_daily)} daily rows")
-print(f"Returns with delisting adjustment: {crsp_daily['dlret'].notna().sum()}")
+print(f"After cleaning: {len(crsp)} monthly rows")
+print(f"Returns with delisting adjustment: {crsp['dlret'].notna().sum()}")
 
 # Calculate market cap (price * shares outstanding)
 # Note: prc can be negative (indicates bid/ask midpoint), take absolute value
-crsp_daily['mktcap'] = abs(crsp_daily['prc']) * crsp_daily['shrout']
+crsp['mktcap'] = abs(crsp['prc']) * crsp['shrout']
 
-# =============================================================================
-# Step 6b: Compound Daily Returns to Monthly Returns
-# =============================================================================
-
-print("\nCompounding daily returns to monthly...")
-
-# Create year-month identifier
-crsp_daily['year'] = crsp_daily['date'].dt.year
-crsp_daily['month'] = crsp_daily['date'].dt.month
-
-# Compound daily returns within each month for each stock
-# Monthly return = product of (1 + daily_ret) - 1
-def compound_returns(daily_rets):
-    """Compound daily returns to get monthly return"""
-    return (1 + daily_rets).prod() - 1
-
-# Get end-of-month values for price, shares, market cap, and SIC code
-crsp_monthly = crsp_daily.groupby(['permno', 'year', 'month']).agg({
-    'ret_adj': compound_returns,      # Compound daily returns
-    'prc': 'last',                     # End of month price
-    'shrout': 'last',                  # End of month shares
-    'mktcap': 'last',                  # End of month market cap
-    'hsiccd': 'last',                  # SIC code (should be constant)
-    'date': 'max'                      # Last trading day of month
-}).reset_index()
-
-# Rename for clarity
-crsp = crsp_monthly.copy()
+# Add year and month columns for portfolio construction
+crsp['year'] = crsp['date'].dt.year
+crsp['month'] = crsp['date'].dt.month
 
 print(f"Monthly observations: {len(crsp)}")
 print(f"Unique securities: {crsp['permno'].nunique()}")
 
 # =============================================================================
-# Step 7: Close connection and save intermediate data
+# Step 7: Pull CRSP Value-Weighted Market Index
+# =============================================================================
+
+# Pull CRSP value-weighted market return for benchmark comparison
+vwretd_query = """
+    SELECT date, vwretd
+    FROM crsp.msi
+    WHERE date BETWEEN '1980-01-01' AND '2022-12-31'
+"""
+
+print("\nPulling CRSP value-weighted market index...")
+market_index = conn.raw_sql(vwretd_query)
+market_index['date'] = pd.to_datetime(market_index['date'])
+market_index['vwretd'] = pd.to_numeric(market_index['vwretd'], errors='coerce')
+print(f"Market index rows: {len(market_index)}")
+print(f"Average monthly market return: {market_index['vwretd'].mean()*100:.3f}%")
+
+# =============================================================================
+# Step 7b: Pull Risk-Free Rate (1-Month T-Bill)
+# =============================================================================
+
+# Pull 1-month T-bill rate from CRSP
+# t30ret = 30-day T-bill return (closest to 1-month)
+rf_query = """
+    SELECT caldt, t30ret
+    FROM crsp.mcti
+    WHERE caldt BETWEEN '1980-01-01' AND '2022-12-31'
+"""
+
+print("\nPulling risk-free rate (1-month T-bill)...")
+rf_rate = conn.raw_sql(rf_query)
+rf_rate = rf_rate.rename(columns={'caldt': 'date', 't30ret': 'rf'})
+rf_rate['date'] = pd.to_datetime(rf_rate['date'])
+rf_rate['rf'] = pd.to_numeric(rf_rate['rf'], errors='coerce')
+
+# Convert from percentage to decimal if needed
+# CRSP typically stores as decimal already, but check
+if rf_rate['rf'].mean() > 1:
+    print("Converting risk-free rate from percentage to decimal...")
+    rf_rate['rf'] = rf_rate['rf'] / 100
+
+print(f"Risk-free rate rows: {len(rf_rate)}")
+print(f"Average monthly RF rate: {rf_rate['rf'].mean()*100:.3f}%")
+print(f"Average annual RF rate: {rf_rate['rf'].mean()*12*100:.2f}%")
+
+# Merge risk-free rate with market index
+market_index = market_index.merge(rf_rate[['date', 'rf']], on='date', how='left')
+
+# Forward fill any missing RF values (rare case)
+if market_index['rf'].isna().any():
+    print(f"Filling {market_index['rf'].isna().sum()} missing RF values...")
+    market_index['rf'] = market_index['rf'].fillna(method='ffill')
+
+print(f"Combined market data rows: {len(market_index)}")
+
+# =============================================================================
+# Step 8: Close connection and save intermediate data
 # =============================================================================
 
 conn.close()
@@ -215,11 +247,13 @@ print(f"\nSaving data (format: {OUTPUT_FORMAT})...")
 if OUTPUT_FORMAT in ('parquet', 'both'):
     compustat_linked.to_parquet('compustat_linked.parquet', index=False)
     crsp.to_parquet('crsp_monthly.parquet', index=False)
-    print("  Saved: compustat_linked.parquet, crsp_monthly.parquet")
+    market_index.to_parquet('market_index.parquet', index=False)
+    print("  Saved: compustat_linked.parquet, crsp_monthly.parquet, market_index.parquet")
 
 if OUTPUT_FORMAT in ('csv', 'both'):
     compustat_linked.to_csv('compustat_linked.csv', index=False)
     crsp.to_csv('crsp_monthly.csv', index=False)
-    print("  Saved: compustat_linked.csv, crsp_monthly.csv")
+    market_index.to_csv('market_index.csv', index=False)
+    print("  Saved: compustat_linked.csv, crsp_monthly.csv, market_index.csv")
 
 print("Data save complete.")
